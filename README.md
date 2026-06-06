@@ -1,6 +1,3 @@
-
-raw
-Readme · MD
 # Cloud-Native Payment API on Amazon EKS
  
 ![Terraform](https://img.shields.io/badge/Terraform-1.5+-purple?logo=terraform)

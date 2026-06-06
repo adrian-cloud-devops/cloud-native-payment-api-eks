@@ -19,3 +19,5 @@ common_tags = {
   Environment = "dev"
   ManagedBy   = "Terraform"
 }
+
+github_repository = "adrian-cloud-devops/eks-platform"

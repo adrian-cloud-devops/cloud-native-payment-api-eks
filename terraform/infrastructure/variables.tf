@@ -66,3 +66,8 @@ variable "node_max_size" {
   type        = number
   default     = 3
 }
+
+variable "github_repository" {
+  description = "GitHub repository in format: org/repo"
+  type        = string
+}

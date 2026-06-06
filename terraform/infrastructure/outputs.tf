@@ -33,3 +33,8 @@ output "ecr_repository_url" {
   description = "ECR repository URL"
   value       = module.ecr.repository_url
 }
+
+output "github_actions_role_arn" {
+  description = "IAM Role ARN for GitHub Actions — GitHub Secrets"
+  value       = module.github_actions_iam.role_arn
+}

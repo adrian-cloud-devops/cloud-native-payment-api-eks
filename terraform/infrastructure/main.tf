@@ -2,6 +2,8 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+data "aws_caller_identity" "current" {}
+
 module "vpc" {
   source = "./modules/vpc"
 
@@ -32,4 +34,13 @@ module "ecr" {
   source = "./modules/ecr"
 
   repository_name = "payment-api"
+}
+
+module "github_actions_iam" {
+  source = "./modules/github-actions-iam"
+
+  cluster_name      = var.cluster_name
+  github_repository = var.github_repository
+  aws_account_id    = data.aws_caller_identity.current.account_id
+  ecr_repository_arn = module.ecr.repository_arn
 }
