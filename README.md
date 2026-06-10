@@ -253,6 +253,284 @@ The initial expectation was that cluster management would require SSH access to 
  ![Validation](docs/sprint-01-validation.png)
 
  
+# Sprint 2 — CI/CD Pipeline with GitHub Actions
+ 
+## Objective
+ 
+The objective of Sprint 2 was to eliminate all manual deployment steps introduced in Sprint 1 and replace them with a fully automated, security-first CI/CD pipeline.
+ 
+Before this sprint, every code change required a manual sequence: local Docker build, manual ECR authentication, manual image push, and manual `kubectl apply`. This approach does not scale, is error-prone, and — critically — requires long-lived AWS credentials stored somewhere accessible to the operator. Sprint 2 solves all of these problems at once.
+ 
+The pipeline is built around three principles: no static AWS credentials anywhere, a security gate that blocks vulnerable images before they reach the cluster, and a clean separation between the build phase and the deploy phase.
+ 
+---
+ 
+## Architecture
+ 
+```
+Developer
+    │
+    │  git push → main
+    ▼
+GitHub Actions Runner
+    │
+    ├── 1. OIDC token request → AWS STS
+    │       └── STS validates token against GitHub OIDC provider
+    │       └── Returns temporary credentials (15 min TTL)
+    │
+    ├── 2. CI Job
+    │       ├── docker build
+    │       ├── Trivy scan → CRITICAL CVE? → pipeline fails, nothing pushed
+    │       └── docker push → ECR (only if scan passes)
+    │
+    └── 3. CD Job (only on push to main, not on PR)
+            ├── aws eks update-kubeconfig
+            ├── sed IMAGE_PLACEHOLDER → actual ECR URL:tag
+            ├── kubectl apply -f k8s/
+            └── kubectl rollout status → verify deploy succeeded
+```
+ 
+---
+ 
+## Components Implemented
+ 
+### IAM Role for GitHub Actions
+ 
+A dedicated IAM Role was created through Terraform in a new module `modules/github-actions-iam`.
+ 
+The role has two policy attachments:
+ 
+**ECR policy** — scoped to the specific ECR repository ARN, not `*`. Allows only the operations needed for image push: layer upload, image put, authorization token. Read operations are included to support layer deduplication during push.
+ 
+**EKS policy** — allows only `eks:DescribeCluster` on the specific cluster ARN. This is the minimum required for `aws eks update-kubeconfig` to work. GitHub Actions cannot list clusters, cannot modify the cluster, cannot access other clusters in the account.
+ 
+### OIDC Trust Policy
+ 
+The IAM Role trust policy uses two conditions:
+ 
+```json
+"StringEquals": {
+  "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+},
+"StringLike": {
+  "token.actions.githubusercontent.com:sub": "repo:adrian-cloud-devops/cloud-native-payment-api-eks:*"
+}
+```
+ 
+The `aud` condition ensures the token was intended for AWS STS, not another service. The `sub` condition scopes the trust to a specific GitHub repository — even if another repository in the same GitHub organization tries to assume this role, it will be denied. The `*` wildcard at the end allows any branch and any workflow in the repository to assume the role. In a production setup this would be scoped further to `ref:refs/heads/main` to restrict deploys to the main branch only.
+ 
+![IAM Trust Policy](docs/sprint-02-iam-trust-policy.png)
+*IAM Role trust policy scoped to the specific GitHub repository — only this repo can assume the role*
+ 
+### GitHub OIDC Provider in AWS
+ 
+A separate `aws_iam_openid_connect_provider` resource was created for GitHub's OIDC endpoint (`token.actions.githubusercontent.com`). This is distinct from the EKS OIDC provider created in Sprint 1 — that one is for pod-level IAM (IRSA), this one is for GitHub Actions authentication.
+ 
+The thumbprint `6938fd4d98bab03faadb97b34396831e3780aea1` is the SHA1 fingerprint of GitHub's OIDC certificate root. AWS uses this to verify that tokens claiming to come from GitHub actually do.
+ 
+### EKS Access Entry
+ 
+GitHub Actions needs not just AWS credentials but also Kubernetes RBAC permissions to deploy. EKS Access Entries (the newer authentication model, replacing `aws-auth` ConfigMap) were used to grant the GitHub Actions role the `AmazonEKSEditPolicy` scoped to the `payment-api` namespace only.
+ 
+This means GitHub Actions can create and update Deployments, Services, and ConfigMaps in `payment-api` — but cannot touch `kube-system`, cannot read secrets from other namespaces, and cannot modify cluster-level resources.
+ 
+---
+ 
+## Pipeline Design Decisions
+ 
+### Why two separate jobs (ci and cd)?
+ 
+Separating CI from CD is not just organizational — it has a functional consequence. The `cd` job runs only when `github.event_name == 'push'` and `github.ref == 'refs/heads/main'`. Pull requests trigger only the `ci` job. This means every PR gets a build and security scan, but nothing gets deployed until code is merged to main.
+ 
+The alternative — a single job — would either deploy on every PR (dangerous) or require complex conditional logic inside a single job (messy). Two jobs with explicit conditions is cleaner and safer.
+ 
+### Why commit SHA as image tag?
+ 
+```yaml
+echo "tag=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+```
+ 
+The first 8 characters of the commit SHA are used as the image tag. This provides:
+ 
+- **Traceability** — given any running pod, you can look at its image tag and find the exact commit that produced it
+- **Immutability** — unlike `:latest`, a SHA-based tag always refers to the same image
+- **Auditability** — ECR shows exactly which commits have been built and when
+The `:latest` tag is also pushed alongside the SHA tag for convenience, but the deployment always uses the SHA tag. Using `:latest` in a Deployment spec would make rollbacks ambiguous — you would not know which version `:latest` actually points to at any given time.
+ 
+### Why Trivy before push?
+ 
+The scan runs against the locally built image, before it is pushed to ECR:
+ 
+```
+build → scan → (fail here if CRITICAL) → push
+```
+ 
+This is a deliberate security gate. An image with a known critical vulnerability never reaches ECR and never reaches the cluster. If the scan ran after the push, a vulnerable image would exist in ECR even if the pipeline failed — it could still be pulled manually or by another process.
+ 
+`ignore-unfixed: true` means Trivy only fails the pipeline on CVEs that have a known fix available. Failing on unfixed CVEs would block legitimate deployments for vulnerabilities the base image maintainer has not yet patched — a situation outside the developer's control.
+ 
+### Why `kubectl rollout status` at the end?
+ 
+```bash
+kubectl rollout status deployment/payment-api \
+  --namespace payment-api \
+  --timeout=300s
+```
+ 
+`kubectl apply` returns success as soon as the API server accepts the manifest — not when the pods are actually running. A deployment could fail (image pull error, readiness probe failure, OOMKill) after `kubectl apply` exits with code 0.
+ 
+`kubectl rollout status` blocks until the rollout either completes successfully or times out. If the new pods do not become ready within 5 minutes, the pipeline fails. This makes the pipeline an accurate signal: green means the application is actually running, not just that the manifest was accepted.
+ 
+---
+ 
+## Security Model
+ 
+The security model for this sprint can be summarized as: **no long-lived credentials exist anywhere in this pipeline**.
+ 
+| What | Old approach | This sprint |
+|---|---|---|
+| AWS auth in pipeline | IAM User + access key in GitHub Secrets | OIDC → temporary STS credentials (15 min TTL) |
+| ECR permissions | Full ECR access or AdministratorAccess | Scoped to single repository, push operations only |
+| EKS permissions | Full cluster access or cluster-admin | Edit policy scoped to `payment-api` namespace only |
+| Vulnerable images | No gate | Trivy blocks CRITICAL CVEs before push |
+| Credentials rotation | Manual | Not needed — credentials are ephemeral |
+ 
+The attack surface is minimal: if GitHub Actions is compromised, the attacker gets 15-minute credentials that can push to one ECR repository and deploy to one Kubernetes namespace. They cannot access other AWS services, other clusters, or other namespaces.
+ 
+---
+ 
+## Workflow Structure
+ 
+```yaml
+on:
+  push:
+    branches: [main]      # triggers ci + cd
+  pull_request:
+    branches: [main]      # triggers ci only
+ 
+jobs:
+  ci:                     # runs on push AND pull_request
+    - Configure AWS (OIDC)
+    - Login to ECR
+    - Generate image tag (SHA-based)
+    - Docker build
+    - Trivy scan (exit-code: 1 on CRITICAL)
+    - Docker push (only if scan passes)
+ 
+  cd:
+    needs: ci             # waits for ci to complete successfully
+    if: push to main      # skipped on pull_request
+    - Configure AWS (OIDC)
+    - Configure kubectl
+    - Deploy (sed + kubectl apply)
+    - Verify rollout
+```
+ 
+---
+ 
+## Challenges Encountered
+ 
+### OIDC authentication failing — wrong repository name
+ 
+The first pipeline run failed with:
+ 
+```
+Error: Could not assume role with OIDC:
+Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
+ 
+The root cause was a mismatch between the GitHub repository name in `terraform.tfvars` (`eks-platform`) and the actual repository name on GitHub (`cloud-native-payment-api-eks`). The IAM trust policy condition uses a `StringLike` match against the repository name — any mismatch causes an immediate denial.
+ 
+The fix was correcting `github_repository` in `terraform.tfvars` and running `terraform apply` to update only the trust policy. Terraform did not rebuild any infrastructure — it only modified the IAM role's trust relationship document.
+ 
+The lesson: the repository name in the trust policy must be an exact match (case-sensitive) to the GitHub repository path. This is worth validating before the first `terraform apply` rather than after.
+ 
+### EKS authentication mode incompatible with Access Entries
+ 
+```
+InvalidRequestException: The cluster's authentication mode must be set
+to one of [API, API_AND_CONFIG_MAP] to perform this operation.
+```
+ 
+The EKS cluster was created with the default authentication mode (`CONFIG_MAP` only), which does not support the Access Entries API. Access Entries are the newer, recommended approach — they replace the manual management of the `aws-auth` ConfigMap.
+ 
+The cluster authentication mode was updated without rebuilding the cluster:
+ 
+```bash
+aws eks update-cluster-config \
+  --name payment-api-eks \
+  --region eu-central-1 \
+  --access-config authenticationMode=API_AND_CONFIG_MAP
+```
+ 
+`API_AND_CONFIG_MAP` supports both the new Access Entries API and the legacy ConfigMap approach simultaneously. This provides backwards compatibility — existing entries in `aws-auth` ConfigMap continue to work alongside new Access Entry resources.
+ 
+Going forward, the EKS module Terraform code should explicitly set `authentication_mode = "API_AND_CONFIG_MAP"` to avoid this issue on future cluster builds.
+ 
+### namespace "payment-api" not found on initial kubectl apply
+ 
+```
+Error from server (NotFound): error when creating "k8s\\deployment.yaml":
+namespaces "payment-api" not found
+```
+ 
+`kubectl apply -f k8s/` applies manifests in alphabetical order. `deployment.yaml` is processed before `namespace.yaml`, so the Deployment attempts to create resources in a namespace that does not yet exist.
+ 
+The fix for the initial manual deploy was applying the namespace first:
+ 
+```bash
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/
+```
+ 
+In the CI/CD pipeline this is not an issue because the namespace already exists from the initial setup. For a clean cluster bootstrap the correct approach is either to apply manifests in explicit order or to use Helm (introduced in Sprint 5), which handles dependency ordering automatically.
+ 
+---
+ 
+## Validation
+ 
+### Pipeline — full run success
+ 
+![Pipeline Success](docs/sprint-02-pipeline-success.png)
+*Both CI and CD jobs completed successfully — total duration 1m 4s. Build & Scan (45s) feeds into Deploy to EKS (14s) via the `needs: ci` dependency.*
+ 
+### Trivy security scan — clean result
+ 
+![Trivy Scan](docs/sprint-02-trivy-scan.png)
+*Trivy scanned the image against the Debian base OS and all Python packages. Zero vulnerabilities detected across all targets. The pipeline proceeded to push the image to ECR only after this gate passed.*
+ 
+### ECR — image tagged with commit SHA
+ 
+![ECR Images](docs/sprint-02-ecr-images.png)
+*ECR repository showing the image pushed by the pipeline tagged with commit SHA `4561ca0e` alongside `:latest`. The SHA tag provides full traceability — any running pod can be traced back to the exact commit that produced its image.*
+ 
+### Pods running after pipeline deploy
+![Pods Running](docs/sprint-02-pods-validation.png)
+ 
+---
+ 
+## Key Lessons Learned
+ 
+**OIDC is the correct authentication pattern for CI/CD on AWS.** The alternative — IAM User with long-lived access keys stored in GitHub Secrets — creates a credential that never expires, cannot be scoped to a single workflow run, and must be manually rotated. OIDC tokens are ephemeral by design: they are issued per-run, scoped to the specific repository, and expire automatically. There is no credential to rotate, no secret to leak, and no manual intervention required.
+ 
+**Pipeline failure modes matter as much as the happy path.** A pipeline that shows green when the application is broken is worse than no pipeline at all. Two design decisions prevent this: Trivy blocks vulnerable images before they reach the cluster, and `kubectl rollout status` blocks the pipeline until pods are actually running. The result is a pipeline where green genuinely means the application is healthy.
+ 
+**Namespace isolation compounds across the stack.** The GitHub Actions role is scoped to the `payment-api` namespace at the Kubernetes level, the ECR policy is scoped to the `payment-api` repository at the AWS level, and the application runs in the `payment-api` namespace at the Kubernetes level. Each layer independently enforces the same boundary. Compromising any single layer does not automatically grant access to the others.
+ 
+---
+ 
+## Sprint Outcome
+ 
+From this sprint forward, the deployment workflow is:
+ 
+```
+git push → pipeline runs → application deployed → rollout verified
+```
+ 
+No manual steps. No AWS credentials on any developer machine involved in the deployment. No unscanned images reaching the cluster. Every deployment is traceable to a specific commit SHA visible in both the ECR image tag and the pod's image specification.
+ 
+The infrastructure layer (Terraform) remains a separate, manual operation — as it should be. Infrastructure changes are infrequent, high-impact, and benefit from human review before apply. Application changes are frequent, lower-impact, and benefit from automation. Sprint 2 establishes that boundary explicitly.
+
 ## Deployment
  
 ### Prerequisites
