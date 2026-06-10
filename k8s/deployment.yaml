@@ -24,7 +24,7 @@ spec:
         runAsUser: 1000
       containers:
         - name: payment-api
-          image: 757906495185.dkr.ecr.eu-central-1.amazonaws.com/payment-api:latest
+          image: IMAGE_PLACEHOLDER
           ports:
             - containerPort: 5000
           env:

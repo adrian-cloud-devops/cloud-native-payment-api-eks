@@ -20,4 +20,4 @@ common_tags = {
   ManagedBy   = "Terraform"
 }
 
-github_repository = "adrian-cloud-devops/eks-platform"
+github_repository =  "adrian-cloud-devops/cloud-native-payment-api-eks"
