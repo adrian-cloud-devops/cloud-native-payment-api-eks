@@ -71,3 +71,13 @@ variable "github_repository" {
   description = "GitHub repository in format: org/repo"
   type        = string
 }
+
+variable "dynamodb_table_name" {
+  description = "DynamoDB table name for payments"
+  type        = string
+  default     = "payment-api-payments"
+}
+variable "admin_user_arn" {
+  description = "IAM User ARN for local kubectl access"
+  type        = string
+}

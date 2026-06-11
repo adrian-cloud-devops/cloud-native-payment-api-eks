@@ -20,4 +20,6 @@ common_tags = {
   ManagedBy   = "Terraform"
 }
 
+admin_user_arn = "arn:aws:iam::757906495185:user/adrian"
+
 github_repository =  "adrian-cloud-devops/cloud-native-payment-api-eks"

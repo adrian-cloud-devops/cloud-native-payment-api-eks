@@ -38,3 +38,13 @@ output "github_actions_role_arn" {
   description = "IAM Role ARN for GitHub Actions — GitHub Secrets"
   value       = module.github_actions_iam.role_arn
 }
+
+output "dynamodb_table_name" {
+  description = "DynamoDB table name"
+  value       = module.dynamodb.table_name
+}
+
+output "payment_api_role_arn" {
+  description = "IAM Role ARN for payment-api pod — wklej do serviceaccount.yaml"
+  value       = module.irsa.role_arn
+}

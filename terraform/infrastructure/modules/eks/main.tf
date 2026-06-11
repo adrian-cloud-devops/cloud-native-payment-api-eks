@@ -52,6 +52,10 @@ resource "aws_eks_cluster" "main" {
   version  = var.cluster_version
   role_arn = aws_iam_role.cluster.arn
 
+  access_config {
+    authentication_mode = "API_AND_CONFIG_MAP"
+  }
+
   vpc_config {
     subnet_ids              = var.private_subnet_ids
     endpoint_public_access  = true
@@ -100,4 +104,39 @@ resource "aws_eks_node_group" "main" {
     aws_iam_role_policy_attachment.node_cni_policy,
     aws_iam_role_policy_attachment.node_ecr_policy,
   ]
+}
+
+resource "aws_eks_access_entry" "github_actions" {
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = var.github_actions_role_arn
+}
+
+resource "aws_eks_access_policy_association" "github_actions" {
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = var.github_actions_role_arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
+
+  access_scope {
+    type       = "namespace"
+    namespaces = ["payment-api"]
+  }
+
+  depends_on = [aws_eks_access_entry.github_actions]
+}
+
+resource "aws_eks_access_entry" "admin" {
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = var.admin_user_arn
+}
+
+resource "aws_eks_access_policy_association" "admin" {
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = var.admin_user_arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+
+  access_scope {
+    type = "cluster"
+  }
+
+  depends_on = [aws_eks_access_entry.admin]
 }
