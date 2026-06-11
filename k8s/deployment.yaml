@@ -29,7 +29,11 @@ spec:
             - containerPort: 5000
           env:
             - name: APP_VERSION
-              value: "0.1.0"
+              value: "0.2.0"
+            - name: AWS_REGION
+              value: "eu-central-1"
+            - name: DYNAMODB_TABLE
+              value: "payment-api-payments"
           resources:
             requests:
               cpu: 100m
