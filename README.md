@@ -537,6 +537,272 @@ No manual steps. No AWS credentials on any developer machine. No unscanned image
 
 ---
 
+# Sprint 3 — DynamoDB Integration with IRSA
+
+## Objective
+
+The objective of Sprint 3 was to replace the in-memory storage introduced in Sprint 1 with a persistent, production-grade data layer — and to do so without introducing any static AWS credentials into the application or the cluster.
+
+Before this sprint, payments were stored in a Python dictionary inside the pod. A pod restart meant losing all data. More importantly, any future AWS service integration would require storing AWS credentials somewhere — as environment variables, Kubernetes Secrets, or hardcoded values. Sprint 3 solves both problems at once: DynamoDB provides persistent storage, and IRSA provides the authentication mechanism to access it without any long-lived credentials.
+
+---
+
+## Architecture
+
+```
+POST /payments
+    │
+    ▼
+Flask API (pod)
+    │
+    ├── JWT token mounted at:
+    │   /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+    │
+    ├── boto3 sends token to AWS STS:
+    │   "AssumeRoleWithWebIdentity"
+    │
+    ├── STS verifies token against EKS OIDC Provider
+    │
+    ├── STS returns temporary credentials (1h TTL)
+    │
+    └── boto3 calls DynamoDB PutItem
+            └── data persists across pod restarts
+```
+
+**IRSA trust chain:**
+
+```
+EKS OIDC Provider    ← registered in Sprint 1, used here
+    ↓ issues JWT tokens for pods
+ServiceAccount       ← annotated with IAM Role ARN
+    ↓ pods using this SA get the token automatically
+IAM Role             ← trust policy scoped to this SA + namespace
+    ↓ only this pod in this namespace can assume this role
+IAM Policy           ← GetItem + PutItem on this specific table only
+    ↓ least privilege — nothing else accessible
+DynamoDB Table       ← payment-api-payments
+```
+
+---
+
+## Components Implemented
+
+### DynamoDB Table — `modules/dynamodb/`
+
+A dedicated Terraform module provisions the payments table:
+
+```hcl
+resource "aws_dynamodb_table" "payments" {
+  name         = var.table_name
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "payment_id"
+
+  attribute {
+    name = "payment_id"
+    type = "S"
+  }
+}
+```
+
+`PAY_PER_REQUEST` billing was chosen over provisioned capacity — for a dev/portfolio workload with unpredictable traffic, on-demand billing costs nothing when idle and scales automatically under load. No capacity planning required.
+
+`payment_id` as the hash key means every payment is uniquely addressable by its ID — which maps directly to the `GET /payments/{id}` API endpoint.
+
+### IRSA Module — `modules/irsa/`
+
+A reusable Terraform module that creates an IAM Role with a trust policy scoped to a specific Kubernetes ServiceAccount:
+
+```hcl
+Condition = {
+  StringEquals = {
+    "${oidc_url}:sub" = "system:serviceaccount:payment-api:payment-api"
+    "${oidc_url}:aud" = "sts.amazonaws.com"
+  }
+}
+```
+
+The trust policy uses `StringEquals` (not `StringLike`) — an exact match on both the ServiceAccount name and namespace. A pod in a different namespace with the same ServiceAccount name cannot assume this role. A pod in the same namespace with a different ServiceAccount cannot assume this role.
+
+The IAM Policy attached to the role grants only two DynamoDB operations on the specific table ARN:
+
+```json
+{
+  "Action": ["dynamodb:GetItem", "dynamodb:PutItem"],
+  "Resource": "arn:aws:dynamodb:eu-central-1:ACCOUNT:table/payment-api-payments"
+}
+```
+
+No `Scan`, no `DeleteItem`, no `UpdateItem`, no access to other tables. This is least privilege at the pod level — something not achievable with node IAM roles.
+
+The module is designed to be reusable — any future service that needs AWS access gets its own IRSA module invocation with its own scoped role.
+
+### EKS Access Entries — moved to Terraform
+
+A recurring operational issue (detailed in Challenges) led to moving EKS Access Entries into Terraform:
+
+```hcl
+access_config {
+  authentication_mode = "API_AND_CONFIG_MAP"
+}
+
+resource "aws_eks_access_entry" "github_actions" { ... }
+resource "aws_eks_access_entry" "admin" { ... }
+```
+
+Every `terraform apply` now automatically configures cluster access for both the CI/CD pipeline and the local operator. No manual CLI commands required after provisioning.
+
+### ServiceAccount — annotated for IRSA
+
+The `payment-api` ServiceAccount created empty in Sprint 1 now has the IRSA annotation:
+
+```yaml
+annotations:
+  eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/payment-api-eks-payment-api-role
+```
+
+This single annotation is the only Kubernetes-side change needed to enable IRSA. EKS automatically detects it at pod start and:
+- mounts the JWT token at `/var/run/secrets/eks.amazonaws.com/serviceaccount/token`
+- injects `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` environment variables
+
+No changes to the Deployment spec were needed — the ServiceAccount was already referenced there since Sprint 1.
+
+### Flask Application — DynamoDB integration
+
+The in-memory dictionary was replaced with boto3 DynamoDB calls:
+
+```python
+dynamodb = boto3.resource("dynamodb", region_name=os.getenv("AWS_REGION"))
+table = dynamodb.Table(os.getenv("DYNAMODB_TABLE", "payment-api-payments"))
+
+# POST /payments
+table.put_item(Item={"payment_id": payment_id, "status": "created"})
+
+# GET /payments/{id}
+response = table.get_item(Key={"payment_id": payment_id})
+```
+
+boto3 automatically discovers credentials through the AWS credential provider chain. When `AWS_WEB_IDENTITY_TOKEN_FILE` is present (injected by EKS via IRSA), boto3 uses it to obtain temporary STS credentials. No explicit credential configuration in the application code — the infrastructure handles authentication transparently.
+
+---
+
+## Why Node IAM Role Was Not Used
+
+The simplest way to give the application DynamoDB access would have been adding a DynamoDB policy to the node IAM role. This was deliberately rejected:
+
+```
+Node IAM Role approach:
+  Every pod on the node gets DynamoDB access
+  → prometheus pods, coredns pods, system pods
+  → any compromised pod on the node has database access
+
+IRSA approach:
+  Only the payment-api pod with the payment-api ServiceAccount
+  in the payment-api namespace gets DynamoDB access
+  → blast radius of a compromised pod is limited to one table
+  → two operations only: GetItem and PutItem
+```
+
+IRSA enables least privilege at the pod level. Node IAM roles enable least privilege at the node level — a much coarser granularity that is insufficient for production security requirements.
+
+---
+
+## Validation
+
+### IRSA active — environment variables injected by EKS
+
+![IRSA Env Vars](docs/sprint-03-env-var-irsa.png)  
+*`AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` injected automatically by EKS when the ServiceAccount has the IRSA annotation. No static credentials anywhere in the pod.*
+
+### ServiceAccount with IRSA annotation
+
+![ServiceAccount](docs/sprint-03-service-account.png)  
+*ServiceAccount annotated with the IAM Role ARN. This single annotation connects the Kubernetes identity layer to the AWS IAM layer.*
+
+### Persistence test — data survives pod restart
+
+![Persistence Test](docs/sprint-03-persistence-test.png)  
+*Payment created, pod restarted with `kubectl rollout restart`, payment retrieved successfully after restart. In-memory storage would have returned 404 — DynamoDB returns the original record.*
+
+### DynamoDB Console — records visible
+
+![DynamoDB Console](docs/sprint-03-dynamodb-console.png)  
+*Two payment records in the DynamoDB table. Data written by the Flask API through IRSA credentials, visible in AWS Console independently of any pod state.*
+
+---
+
+## Challenges Encountered
+
+### EKS Access Entries lost after terraform destroy
+
+After every `terraform destroy` and `terraform apply` cycle, the EKS cluster was recreated without any Access Entries. Both the local operator and GitHub Actions lost cluster access — requiring manual CLI commands to restore it each time.
+
+The root cause: EKS in `API_AND_CONFIG_MAP` authentication mode does not automatically grant the cluster creator any access. Every principal must be explicitly defined through Access Entries. This is a deliberate security design — but it means the infrastructure code must be complete.
+
+The fix was adding Access Entry resources directly to the EKS Terraform module:
+
+```hcl
+resource "aws_eks_access_entry" "admin" {
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = var.admin_user_arn
+}
+
+resource "aws_eks_access_policy_association" "admin" {
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = var.admin_user_arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+  access_scope  { type = "cluster" }
+}
+```
+
+From this point forward, `terraform apply` produces a fully accessible cluster with no manual steps required.
+
+The lesson: infrastructure that requires manual post-provisioning steps is incomplete infrastructure. If a step is required every time, it belongs in Terraform.
+
+### ServiceAccount annotation not applied — pipeline deployed stale manifest
+
+After adding the IRSA annotation to `serviceaccount.yaml` and pushing, the pipeline ran successfully but the pod was missing `AWS_ROLE_ARN` in its environment. IRSA was not active.
+
+The root cause was a timing issue: the namespace `payment-api` did not exist when the pipeline first ran. `kubectl apply -f k8s/` partially succeeded — some resources were created, some were not. On subsequent runs the namespace existed, but `serviceaccount/payment-api` was already in the cluster from the partial first run — created without the annotation. `kubectl apply` updates existing resources but does not force-recreate them, so the stale ServiceAccount without the annotation remained.
+
+The fix was applying the ServiceAccount manually to force the update:
+
+```bash
+kubectl apply -f k8s/serviceaccount.yaml
+kubectl rollout restart deployment/payment-api -n payment-api
+```
+
+The restart is required because the IRSA token is mounted at pod start — existing pods do not pick up ServiceAccount changes without a restart.
+
+The underlying issue — namespace not existing before the pipeline runs — will be resolved in Sprint 5 when Helm takes over manifest management and handles resource ordering correctly.
+
+---
+
+## Key Lessons Learned
+
+**IRSA and node IAM roles solve different problems.** Node roles give identity to the compute layer — they exist so nodes can join the cluster, pull images, and manage networking. Pod roles give identity to the application layer — they exist so specific workloads can access specific AWS services. Conflating the two by putting application permissions on node roles violates least privilege and creates unnecessary blast radius.
+
+**Infrastructure code must be complete.** Any manual step required after `terraform apply` is a gap in the infrastructure code. Access Entries that need to be added by hand, namespaces that need to be created by hand, kubeconfig that needs to be updated by hand — these are all indications that the Terraform code is incomplete. A correctly provisioned environment should be fully usable immediately after `terraform apply` with no additional steps.
+
+**Pod restarts are required for ServiceAccount changes to take effect.** IRSA credentials are mounted as a projected volume at pod startup. Updating a ServiceAccount annotation does not automatically update running pods — they continue using the token that was mounted when they started. Any IRSA configuration change requires a rollout restart to take effect.
+
+---
+
+## Sprint Outcome
+
+At the end of Sprint 3 the application has a complete AWS integration:
+
+```
+git push
+    → pipeline builds new image
+    → image deployed to EKS
+    → pod starts with IRSA token mounted automatically
+    → boto3 exchanges token for temporary STS credentials
+    → POST /payments writes to DynamoDB
+    → GET /payments/{id} reads from DynamoDB
+    → pod restart does not affect stored data
+```
+
+No static AWS credentials exist anywhere — not in the application code, not in Kubernetes Secrets, not in environment variables. Authentication is entirely handled by the IRSA mechanism established in the infrastructure layer.
 ## Deployment
 
 ### Prerequisites
