@@ -123,7 +123,24 @@
           "aws:ResourceTag/elbv2.k8s.aws/cluster": "false"
         }
       }
-    },
+    },{
+  "Effect": "Allow",
+  "Action": [
+    "elasticloadbalancing:DescribeLoadBalancers",
+    "elasticloadbalancing:DescribeLoadBalancerAttributes",
+    "elasticloadbalancing:DescribeListeners",
+    "elasticloadbalancing:DescribeListenerAttributes",
+    "elasticloadbalancing:DescribeListenerCertificates",
+    "elasticloadbalancing:DescribeSSLPolicies",
+    "elasticloadbalancing:DescribeRules",
+    "elasticloadbalancing:DescribeTargetGroups",
+    "elasticloadbalancing:DescribeTargetGroupAttributes",
+    "elasticloadbalancing:DescribeTargetHealth",
+    "elasticloadbalancing:DescribeTags",
+    "elasticloadbalancing:DescribeTrustStores"
+  ],
+  "Resource": "*"
+},
     {
       "Effect": "Allow",
       "Action": [
