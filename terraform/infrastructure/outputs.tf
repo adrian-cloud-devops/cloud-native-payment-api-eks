@@ -48,3 +48,8 @@ output "payment_api_role_arn" {
   description = "IAM Role ARN for payment-api pod — wklej do serviceaccount.yaml"
   value       = module.irsa.role_arn
 }
+
+output "lbc_role_arn" {
+  description = "IAM Role ARN for AWS Load Balancer Controller"
+  value       = module.eks.lbc_role_arn
+}

@@ -17,3 +17,8 @@ output "oidc_provider_arn" {
 output "oidc_provider_url" {
   value = aws_iam_openid_connect_provider.eks.url
 }
+
+output "lbc_role_arn" {
+  description = "IAM Role ARN for AWS Load Balancer Controller"
+  value       = aws_iam_role.lbc.arn
+}
