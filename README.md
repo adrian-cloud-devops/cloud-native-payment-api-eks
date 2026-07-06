@@ -803,6 +803,249 @@ git push
 ```
 
 No static AWS credentials exist anywhere — not in the application code, not in Kubernetes Secrets, not in environment variables. Authentication is entirely handled by the IRSA mechanism established in the infrastructure layer.
+# Sprint 4 — Ingress and Public Endpoint
+ 
+## Objective
+ 
+The objective of Sprint 4 was to expose the Payment API to the internet through a production-grade ingress layer. Before this sprint, the application was only accessible internally via `kubectl port-forward` — a developer convenience, not a real deployment pattern.
+ 
+The goal was not just to make the application publicly accessible, but to do so through the correct AWS-native architecture: an Application Load Balancer managed by the AWS Load Balancer Controller, driven by a Kubernetes Ingress resource.
+ 
+---
+ 
+## Architecture
+ 
+```
+Internet
+    │
+    ▼
+ALB (internet-facing)
+k8s-paymenta-paymenta-xxx.eu-central-1.elb.amazonaws.com
+    │
+    ├── /health   → Service payment-api:80 → Pods
+    └── /payments → Service payment-api:80 → Pods
+ 
+AWS Load Balancer Controller (pod in kube-system)
+    ├── watches Ingress resources via Kubernetes API
+    ├── calls AWS API to create/update ALB
+    └── authenticates to AWS via IRSA (lbc-role)
+```
+ 
+**How the components connect:**
+ 
+```
+Ingress manifest       ← you define routing rules
+    ↓
+LBC reads Ingress      ← runs as pod in kube-system
+    ↓
+LBC calls AWS API      ← authenticated via IRSA (lbc-role)
+    ↓
+ALB created in         ← placed in public subnets
+public subnets            (tagged in Sprint 1 for this purpose)
+    ↓
+Target Group           ← points directly to pod IPs (target-type: ip)
+```
+ 
+The subnet tags configured in Sprint 1 (`kubernetes.io/role/elb`) are used here — LBC discovers the correct public subnets for the ALB by reading these tags. This is why they were configured at cluster creation time rather than added later.
+ 
+---
+ 
+## Components Implemented
+ 
+### IAM Role for AWS Load Balancer Controller
+ 
+LBC needs to call AWS APIs to create and manage ALB resources — Load Balancers, Target Groups, Security Groups, Listeners. This requires an IAM Role with a comprehensive policy, provisioned through a new IAM resource block in `modules/eks/main.tf`.
+ 
+The trust policy follows the same IRSA pattern used in Sprint 3, scoped to the LBC ServiceAccount in `kube-system`:
+ 
+```json
+"system:serviceaccount:kube-system:aws-load-balancer-controller"
+```
+ 
+The IAM policy is loaded from a dedicated `lbc-policy.json` file — the official AWS-recommended policy document for LBC. This is the standard approach: AWS publishes and maintains this policy document, and it is referenced directly rather than inline.
+ 
+### AWS Load Balancer Controller — installed via Helm
+ 
+LBC is a Kubernetes application — a controller pod that runs inside the cluster and bridges the Kubernetes and AWS worlds. It is not an AWS resource and is not managed by Terraform. The standard installation method is Helm:
+ 
+```bash
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=payment-api-eks \
+  --set serviceAccount.create=true \
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<LBC_ROLE_ARN> \
+  --set region=eu-central-1 \
+  --set vpcId=<VPC_ID>
+```
+ 
+This installs LBC v3.4.0 — the latest version at time of implementation. The VPC ID and cluster name are passed as parameters so LBC knows which AWS environment it is operating in.
+ 
+**Why Helm and not Terraform?** LBC is a complex Kubernetes application with dozens of resources — Deployment, ServiceAccount, RBAC rules, CRDs, webhooks. The official Helm chart packages all of these correctly and handles version upgrades. Terraform's Helm provider exists but creates a tight coupling between infrastructure provisioning and application installation — the cluster must be fully ready before Helm can run, which creates race conditions. Keeping them separate is cleaner and reflects standard industry practice.
+ 
+### Ingress Manifest
+ 
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: payment-api
+  namespace: payment-api
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /payments
+            pathType: Prefix
+            backend:
+              service:
+                name: payment-api
+                port:
+                  number: 80
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: payment-api
+                port:
+                  number: 80
+```
+ 
+Key decisions:
+ 
+**`ingressClassName: alb`** instead of the legacy annotation `kubernetes.io/ingress.class: alb` — LBC v2+ requires the IngressClass approach. Using the old annotation with a newer LBC version results in the Ingress being silently ignored.
+ 
+**`target-type: ip`** routes traffic directly to pod IP addresses rather than through node ports. This is more efficient — one fewer network hop — and works correctly with the VPC CNI plugin where every pod has a real VPC IP address.
+ 
+**`scheme: internet-facing`** places the ALB in public subnets. The pods themselves remain in private subnets — only the ALB is public-facing.
+ 
+---
+ 
+## Challenges Encountered
+ 
+### Ingress ADDRESS remained empty — silent LBC failure
+ 
+After applying the Ingress manifest, `kubectl get ingress` showed an empty ADDRESS field for over 10 minutes. There were no obvious error messages. The application was running, the LBC deployment showed `2/2 Ready` — everything appeared healthy.
+ 
+The correct diagnostic step was `kubectl describe ingress payment-api -n payment-api`, which shows the Events section. This revealed repeated warnings:
+ 
+```
+Warning FailedDeployModel
+User: arn:aws:sts::757906495185:assumed-role/payment-api-eks-lbc-role
+is not authorized to perform: elasticloadbalancing:DescribeListenerAttributes
+because no identity-based policy allows the action
+```
+ 
+The root cause was a missing action in `lbc-policy.json`. The policy included most of the required ELB describe permissions but was missing `elasticloadbalancing:DescribeListenerAttributes` — an action required by LBC v3.4.0 that may not have been present in older policy document versions.
+ 
+The fix involved three steps:
+ 
+First, adding the missing action to `lbc-policy.json` and running `terraform apply` to update the IAM policy in AWS.
+ 
+Second, restarting the LBC deployment to force it to pick up the new IAM permissions:
+ 
+```bash
+kubectl rollout restart deployment/aws-load-balancer-controller -n kube-system
+```
+ 
+Third, waiting approximately 2 minutes for the new LBC pods to start and reconcile the Ingress resource.
+ 
+After the restart, the ADDRESS appeared and the ALB became active.
+ 
+The lesson: when a Kubernetes resource appears to be silently doing nothing, `kubectl describe` is always the correct first diagnostic step. The Events section surfaces errors that are invisible in `kubectl get` output. In this case the application was running fine — only the LBC controller was failing, and only `describe` revealed why.
+ 
+### LBC v3.x requires ingressClassName instead of legacy annotation
+ 
+The initial Ingress manifest used the legacy annotation:
+ 
+```yaml
+annotations:
+  kubernetes.io/ingress.class: alb
+```
+ 
+LBC v3.x no longer processes Ingress resources with this annotation — it only responds to resources using the `ingressClassName` field in the spec. The Ingress was created successfully in Kubernetes but LBC completely ignored it, resulting in no ALB being created and no ADDRESS assigned.
+ 
+The fix was replacing the annotation with the spec field:
+ 
+```yaml
+spec:
+  ingressClassName: alb
+```
+ 
+This is a breaking change introduced in LBC v2.x and documented in the AWS migration guide. When using a recent LBC version, the legacy annotation approach silently does nothing.
+ 
+---
+ 
+## Validation
+ 
+![Ingress with ADDRESS](docs/sprint-04-address.png)
+*Ingress resource with ALB address assigned — LBC successfully created the load balancer in public subnets.*
+ 
+![LBC Deployment](docs/sprint-04-LBC.png)
+*AWS Load Balancer Controller running with 2/2 replicas ready in kube-system namespace.*
+ 
+![Public Endpoint Health Check](docs/sprint-04-endpoint.png)
+*Application responding to HTTP requests from the public internet via ALB.*
+ 
+![POST /payments via ALB](docs/sprint-04-working-post.png)
+*Full end-to-end flow: internet → ALB → pod → DynamoDB. Payment created and returned via public endpoint.*
+ 
+![ALB in AWS Console](docs/sprint-04-LB-console.png)
+*ALB visible in AWS Console in Active state, placed in public subnets as configured.*
+ 
+```
+# Health check via public ALB
+curl http://k8s-paymenta-paymenta-9f4f6c5c32-494556518.eu-central-1.elb.amazonaws.com/health
+{"status":"healthy","version":"0.2.0"}
+ 
+# Create payment via public ALB
+curl -X POST http://k8s-paymenta-paymenta-9f4f6c5c32-494556518.eu-central-1.elb.amazonaws.com/payments
+{"payment_id":"0b078664-cabe-4adf-9740-4f196e26991a","status":"created"}
+ 
+# Retrieve payment via public ALB
+curl http://k8s-paymenta-paymenta-9f4f6c5c32-494556518.eu-central-1.elb.amazonaws.com/payments/0b078664-cabe-4adf-9740-4f196e26991a
+{"payment_id":"0b078664-cabe-4adf-9740-4f196e26991a","status":"created"}
+ 
+# LBC running
+kubectl get deployment -n kube-system aws-load-balancer-controller
+NAME                           READY   UP-TO-DATE   AVAILABLE
+aws-load-balancer-controller   2/2     2            2
+```
+ 
+---
+ 
+## Key Lessons Learned
+ 
+**`kubectl describe` is the correct first diagnostic tool for silent failures.** When a resource exists but nothing happens — no ADDRESS, no error, no logs — the Events section in `kubectl describe` almost always reveals the root cause. `kubectl get` shows current state. `kubectl describe` shows history and errors. This distinction matters significantly when debugging controllers like LBC that operate asynchronously.
+ 
+**IAM policies must be kept current with the software version.** LBC v3.x requires permissions that older versions did not. Copying a policy document from documentation or a previous project without checking the current version requirements leads to silent failures. The correct approach is to always reference the official policy document for the specific version being installed.
+ 
+**LBC is a bridge between two worlds, not a native component of either.** It is not an AWS resource (not managed by Terraform) and not a user-facing Kubernetes resource (not applied by the CI/CD pipeline). It lives in the operational layer between infrastructure provisioning and application deployment. Understanding this boundary clarifies why it is installed by Helm separately from both `terraform apply` and `kubectl apply`.
+ 
+**The subnet tags from Sprint 1 paid off here.** The `kubernetes.io/role/elb` tags on public subnets were configured at cluster creation time specifically for this sprint. Without them, LBC cannot discover where to place the ALB. Configuring prerequisites before they are needed — a pattern established in Sprint 1 with the OIDC provider and ServiceAccount — continues to reduce friction in later sprints.
+ 
+---
+ 
+## Sprint Outcome
+ 
+The Payment API is now publicly accessible via a production-grade AWS Application Load Balancer:
+ 
+```
+Internet
+    → ALB (internet-facing, public subnets)
+        → Kubernetes Ingress routing
+            → payment-api Service
+                → payment-api Pods (private subnets)
+                    → DynamoDB (via IRSA)
+```
+ 
+The application remains secure — pods run in private subnets with no public IP addresses. Only the ALB endpoint is exposed to the internet. The full request path from internet to database is functional and tested.
+
+
 ## Deployment
 
 ### Prerequisites
